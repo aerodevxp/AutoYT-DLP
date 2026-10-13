@@ -12,8 +12,6 @@ in different folders.
   already own get culled, regardless of filename or folder.
 - **Global ID archive** — known videos are skipped outright, across all playlists.
 - **Never overwrites** — existing files are left alone.
-- **Self-contained** — venv, JS runtime and caches all live in the project dir.
-- **Logging + heartbeat** — timestamped log file so long runs never look hung.
 - **Stale `.part` cleanup** — killed runs self-heal.
 
 ## Requirements
