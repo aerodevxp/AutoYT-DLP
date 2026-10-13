@@ -15,12 +15,12 @@ Playlist list file, one entry per line:
   - 'downloaddir' defaults to a folder named after the comment if empty.
 
 Fast pre-check (always on):
-  For playlist/channel URLs, the entry list is fetched in FLAT mode (one
-  request). If every ID is already in the archive, the playlist is skipped
-  without yt-dlp ever resolving a single video. If only some are missing,
-  yt-dlp is told to process just those. If flat extraction looks unsupported
-  (no entries, or a single entry for something that is clearly a collection),
-  it falls back to a normal full run.
+  For playlist/channel URLs the entry list is fetched in FLAT mode (one
+  request). If every ID is already archived, the playlist is skipped without
+  resolving a single video. If only some are missing, yt-dlp is told to fetch
+  just those (by position). Videos the playlist marks as deleted/private are
+  recorded immediately; anything else that turns out dead is recorded after
+  one probe, so it never re-triggers a pass.
 
 Dedupe (folder-independent):
   - A GLOBAL archive records known video IDs so yt-dlp skips them outright.
@@ -83,7 +83,6 @@ AUDIO_FORMAT     = os.getenv("AUDIO_FORMAT", "bestaudio[ext=m4a]/bestaudio")
 JS_RUNTIME_DIR   = os.getenv("JS_RUNTIME_DIR", "").strip()
 CLEAN_PART_FILES = _bool("CLEAN_PART_FILES", "true")
 
-# --- Post-processing toggles (all off by default = no ffmpeg) ---
 AUDIO_CONVERT    = _bool("AUDIO_CONVERT", "false")
 EMBED_THUMBNAIL  = _bool("EMBED_THUMBNAIL", "false")
 EMBED_METADATA   = _bool("EMBED_METADATA", "false")
@@ -98,30 +97,27 @@ VERBOSE    = _bool("VERBOSE", "false")
 IMPERSONATE = os.getenv("IMPERSONATE", "").strip()
 EXTRACTOR_ARGS_RAW = os.getenv("EXTRACTOR_ARGS", "")
 
-# --- Logging ---
 LOG_FILE = os.getenv("LOG_FILE", "./auto_ytdlp.log")
 LOG_PROGRESS_INTERVAL = float(os.getenv("LOG_PROGRESS_INTERVAL", "30"))
 HEARTBEAT_INTERVAL    = float(os.getenv("HEARTBEAT_INTERVAL", "60"))
 SCAN_LOG_EVERY        = int(os.getenv("SCAN_LOG_EVERY", "200"))
 
-# --- Rate limiting / politeness ---
 SLEEP_INTERVAL          = float(os.getenv("SLEEP_INTERVAL", "0"))
 MAX_SLEEP_INTERVAL      = float(os.getenv("MAX_SLEEP_INTERVAL", "0"))
 SLEEP_INTERVAL_REQUESTS = float(os.getenv("SLEEP_INTERVAL_REQUESTS", "0"))
 CONCURRENT_FRAGMENTS    = int(os.getenv("CONCURRENT_FRAGMENTS", "4"))
 
-# --- Dedupe ---
 DEDUPE         = _bool("DEDUPE", "true")
 GLOBAL_ARCHIVE = os.getenv("GLOBAL_ARCHIVE", "./.global_archive.txt")
 LIBRARY_FILE   = os.getenv("LIBRARY_FILE", "./.dedupe_library.json")
+UNAVAILABLE_FILE = os.getenv("UNAVAILABLE_FILE", "./.unavailable_ids.txt")
 DEDUPE_KEEP    = os.getenv("DEDUPE_KEEP", "existing").strip().lower()
 
-# --- Scan ---
 SCAN_ROOTS = [r.strip() for r in os.getenv("SCAN_ROOTS", "").split(";")
               if r.strip()]
 SCAN_EXCLUDE = [e.strip() for e in os.getenv("SCAN_EXCLUDE", "").split(";")
                 if e.strip()]
-SCAN_NEW_ONLY = False   # flipped on for the automatic pre-run sync
+SCAN_NEW_ONLY = False
 
 _DEFAULT_SCAN_EXTS = "mp4,mkv,webm,mp3,m4a,opus,flac,wav,ogg,aac"
 SCAN_EXTS = {
@@ -141,9 +137,14 @@ ID_PATTERNS = [
     re.compile(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})"),
 ]
 
-# URL fragments that suggest a playlist/channel rather than a single video
 COLLECTION_HINTS = ("list=", "/playlist", "/playlists", "/@", "/channel/",
                     "/c/", "/user/", "/videos", "/model/", "/pornstar/")
+
+# Markers that a flat playlist entry is dead on the platform
+UNAVAIL_TITLES = ("[deleted video]", "[private video]", "[unavailable video]",
+                  "[deleted]", "[private]")
+UNAVAIL_AVAIL = ("unavailable", "private", "deleted", "needs_auth",
+                 "premium_only", "subscriber_only")
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +195,40 @@ def start_heartbeat():
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
 
 
+class _YdlLogger:
+    """Routes yt-dlp output through our timestamped logger, filtering noise."""
+
+    _NOISE = ("unavailable videos are hidden", "unavailable video is hidden")
+    _GONE = ("video unavailable", "this video is unavailable",
+             "removed for violating", "has been removed",
+             "private video", "deleted video")
+
+    def debug(self, msg):
+        if msg.startswith("[debug] "):
+            if VERBOSE:
+                log("  " + msg)
+            return
+        if msg.startswith("[download] ") and "%" in msg:
+            return                      # covered by our progress hooks
+        if any(n in msg for n in self._NOISE):
+            return
+        log("  " + msg)
+
+    def info(self, msg):
+        self.debug(msg)
+
+    def warning(self, msg):
+        if any(n in msg for n in self._NOISE):
+            return
+        log("  [warn] " + msg)
+
+    def error(self, msg):
+        if any(g in msg.lower() for g in self._GONE):
+            log("  [gone] " + msg)
+        else:
+            log("  [err] " + msg)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -228,7 +263,6 @@ def parse_extractor_args(raw: str) -> dict:
 
 
 def base_ydl_opts(cookie_file: str | None = None) -> dict:
-    """Shared quiet options for metadata-only extraction."""
     opts = {
         "skip_download": True,
         "quiet": True,
@@ -320,7 +354,6 @@ def setup_js_runtime() -> None:
             os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
         else:
             log(f"[warn] JS_RUNTIME_DIR not found: {d}")
-
     runtime = shutil.which("deno") or shutil.which("node")
     if runtime:
         log(f"[ok] JS runtime: {runtime}")
@@ -333,13 +366,13 @@ def setup_cache() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Archive helpers
+# Archive + unavailable sets
 # ---------------------------------------------------------------------------
 def load_archive_ids(archive_path: str) -> set:
     ids = set()
-    archive_path = os.path.abspath(os.path.expanduser(archive_path))
-    if os.path.isfile(archive_path):
-        for line in open(archive_path, encoding="utf-8"):
+    p = os.path.abspath(os.path.expanduser(archive_path))
+    if os.path.isfile(p):
+        for line in open(p, encoding="utf-8"):
             parts = line.strip().split()
             if len(parts) == 2:
                 ids.add(parts[1])
@@ -347,26 +380,37 @@ def load_archive_ids(archive_path: str) -> set:
 
 
 def remove_from_archive(archive_path: str, vid: str) -> bool:
-    archive_path = os.path.abspath(os.path.expanduser(archive_path))
-    if not os.path.isfile(archive_path):
+    p = os.path.abspath(os.path.expanduser(archive_path))
+    if not os.path.isfile(p):
         return False
-    lines = open(archive_path, encoding="utf-8").read().splitlines()
+    lines = open(p, encoding="utf-8").read().splitlines()
     kept = [l for l in lines if not l.strip().endswith(" " + vid)]
     if len(kept) != len(lines):
-        with open(archive_path, "w", encoding="utf-8") as f:
+        with open(p, "w", encoding="utf-8") as f:
             f.write("\n".join(kept) + "\n")
         return True
     return False
+
+
+def load_unavailable() -> set:
+    p = os.path.abspath(os.path.expanduser(UNAVAILABLE_FILE))
+    if not os.path.isfile(p):
+        return set()
+    return {l.strip() for l in open(p, encoding="utf-8") if l.strip()}
+
+
+def save_unavailable(ids: set):
+    p = os.path.abspath(os.path.expanduser(UNAVAILABLE_FILE))
+    with open(p, "w", encoding="utf-8") as f:
+        for i in sorted(ids):
+            f.write(i + "\n")
 
 
 # ---------------------------------------------------------------------------
 # Flat playlist pre-check
 # ---------------------------------------------------------------------------
 def fetch_playlist_entries(url: str, cookie_file: str | None):
-    """Return list of (playlist_index, video_id) via flat extraction.
-
-    Returns [] if the extractor produced nothing usable.
-    """
+    """Return [{id, title, availability}] in playlist order (one request)."""
     opts = base_ydl_opts(cookie_file)
     opts["extract_flat"] = "in_playlist"
 
@@ -379,7 +423,11 @@ def fetch_playlist_entries(url: str, cookie_file: str | None):
             if not e:
                 continue
             if e.get("id"):
-                out.append((e.get("playlist_index"), e["id"]))
+                out.append({
+                    "id": e["id"],
+                    "title": (e.get("title") or "").strip().lower(),
+                    "availability": (e.get("availability") or "").lower(),
+                })
             if e.get("entries"):
                 walk(e)
 
@@ -387,34 +435,50 @@ def fetch_playlist_entries(url: str, cookie_file: str | None):
     return out
 
 
-def plan_fast_skip(url: str, archive_ids: set, cookie_file: str | None):
-    """Decide whether to skip a collection URL.
+def plan_fast_skip(url: str, archive_ids: set, unavailable: set,
+                   cookie_file: str | None):
+    """Decide how to handle a collection URL.
 
-    Returns (skip: bool, playlist_items: str|None, note: str).
+    Returns dict(skip, items, missing, detected, note).
     """
+    none = {"skip": False, "items": None, "missing": [], "detected": set()}
+
     if not looks_like_collection(url):
-        return False, None, "single item"
+        return {**none, "note": "single item"}
 
     try:
         entries = fetch_playlist_entries(url, cookie_file)
     except Exception as e:
-        return False, None, f"flat fetch failed ({e})"
+        return {**none, "note": f"flat fetch failed ({e})"}
 
     if not entries:
-        return False, None, "flat returned nothing (unsupported?)"
-
-    # A collection resolving to a single entry is suspicious -> full run
+        return {**none, "note": "flat returned nothing (unsupported?)"}
     if len(entries) <= 1:
-        return False, None, "flat returned 1 entry (unsupported?)"
+        return {**none, "note": "flat returned 1 entry (unsupported?)"}
 
-    missing = [(i, v) for i, v in entries if v not in archive_ids]
+    detected = {e["id"] for e in entries
+                if e["title"] in UNAVAIL_TITLES
+                or e["availability"] in UNAVAIL_AVAIL}
+
+    known = archive_ids | unavailable | detected
+    missing = [(i + 1, e["id"]) for i, e in enumerate(entries)
+               if e["id"] not in known]
+
+    bits = []
+    if detected:
+        bits.append(f"{len(detected)} detected-unavailable")
+    cached = len((unavailable - detected) & {e["id"] for e in entries})
+    if cached:
+        bits.append(f"{cached} cached-unavailable")
+    suffix = f" [{', '.join(bits)}]" if bits else ""
+
     if not missing:
-        return True, None, f"all {len(entries)} item(s) already present"
+        return {**none, "skip": True, "detected": detected,
+                "note": f"all {len(entries)} item(s) accounted for{suffix}"}
 
-    idxs = [str(i) for i, _ in missing if i is not None]
-    if len(idxs) == len(missing) and len(missing) < len(entries):
-        return False, ",".join(idxs), f"{len(missing)}/{len(entries)} missing"
-    return False, None, f"{len(missing)}/{len(entries)} missing (full pass)"
+    return {"skip": False, "items": ",".join(str(i) for i, _ in missing),
+            "missing": [v for _, v in missing], "detected": detected,
+            "note": f"{len(missing)}/{len(entries)} missing{suffix}"}
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +536,7 @@ def parse_playlist_file(path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Dedupe post-hook + progress/pp hooks
+# Hooks
 # ---------------------------------------------------------------------------
 def make_post_hook(lib: DedupeLibrary):
     def hook(filename, *args, **kwargs):
@@ -577,10 +641,11 @@ def build_ydl_opts(download_path: str, kind: str, cookie_file: str | None,
         "remote_components": REMOTE_COMPONENTS,
         "cachedir": os.path.abspath(os.path.expanduser(CACHE_DIR)),
 
+        "logger": _YdlLogger(),
         "verbose": VERBOSE,
-        "quiet": not VERBOSE,
+        "quiet": False,
         "no_warnings": False,
-        "progress": True,
+        "noprogress": True,
 
         "progress_hooks": [make_progress_hook()],
         "postprocessor_hooks": [make_pp_hook()],
@@ -665,9 +730,7 @@ def scan_roots(roots, lib: DedupeLibrary, archive_path: str):
     if SCAN_EXCLUDE:
         log(f"[scan] SCAN_EXCLUDE = {SCAN_EXCLUDE}")
 
-    indexed = 0
-    already = 0
-    new_ids = 0
+    indexed = already = new_ids = 0
     seen_exts = {}
     started = time.time()
 
@@ -680,8 +743,7 @@ def scan_roots(roots, lib: DedupeLibrary, archive_path: str):
             log(f"  [scan] skip (no such dir): {r}")
             continue
 
-        count = 0
-        skip_known = 0
+        count = skip_known = 0
         skipped_ext = {}
         pruned = []
         log(f"  [scan] walking {r}")
@@ -762,7 +824,6 @@ def scan_roots(roots, lib: DedupeLibrary, archive_path: str):
 
 
 def prune_dead_entries(lib: DedupeLibrary) -> int:
-    """Drop library entries whose files no longer exist."""
     dead = 0
     for fp in list(lib.fps):
         live = [p for p in lib.fps[fp] if os.path.isfile(p)]
@@ -779,12 +840,10 @@ def prune_dead_entries(lib: DedupeLibrary) -> int:
 
 
 def run_sync(lib: DedupeLibrary, entries):
-    """Prune dead entries, then register any new files. Local, no network."""
     dead = prune_dead_entries(lib)
     log(f"[sync] pruned {dead} dead library entr(ies)")
 
-    roots = list(SCAN_ROOTS) + [p for _, _, _, p in entries]
-    roots = dedupe_nested_roots(roots)
+    roots = dedupe_nested_roots(list(SCAN_ROOTS) + [p for _, _, _, p in entries])
     if not roots:
         return
 
@@ -797,7 +856,7 @@ def run_sync(lib: DedupeLibrary, entries):
 
 
 # ---------------------------------------------------------------------------
-# Prune-removed (playlist deletions)
+# Prune-removed
 # ---------------------------------------------------------------------------
 def video_url_for(playlist_url: str, vid: str):
     host = urlparse(playlist_url).netloc.lower()
@@ -830,7 +889,7 @@ def prune_removed(entries, lib: DedupeLibrary, cookie_file: str | None,
 
         log(f"[prune] {url} -> {root}")
         try:
-            current = {v for _, v in fetch_playlist_entries(url, cookie_file)}
+            current = {e["id"] for e in fetch_playlist_entries(url, cookie_file)}
         except Exception as e:
             log(f"[prune]   playlist fetch failed: {e}")
             continue
@@ -885,16 +944,14 @@ def main():
     ap.add_argument("-e", "--env", default=".env")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-clean", action="store_true")
-    ap.add_argument("--no-sync", action="store_true",
-                    help="Skip the pre-run dead-entry prune + new-file scan.")
-    ap.add_argument("--no-fast", action="store_true",
-                    help="Disable the flat pre-check; always run full extraction.")
+    ap.add_argument("--no-sync", action="store_true")
+    ap.add_argument("--no-fast", action="store_true")
+    ap.add_argument("--recheck-unavailable", action="store_true",
+                    help="Clear the known-unavailable list, then continue.")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--exclude", action="append", default=[], metavar="NAME")
     ap.add_argument("--scan", nargs="*", metavar="DIR")
-    ap.add_argument("--prune-removed", action="store_true",
-                    help="Delete files removed from a playlist, but only if the "
-                         "video still exists on the site.")
+    ap.add_argument("--prune-removed", action="store_true")
     args = ap.parse_args()
 
     if args.env != ".env":
@@ -914,6 +971,10 @@ def main():
     setup_js_runtime()
     setup_cache()
 
+    if args.recheck_unavailable:
+        save_unavailable(set())
+        log("[unavailable] cleared known-unavailable list")
+
     lib = DedupeLibrary(LIBRARY_FILE)
 
     playlist_file = Path(os.path.expanduser(PLAYLIST_FILE))
@@ -924,7 +985,6 @@ def main():
         log(f"Playlist file not found: {playlist_file}")
         sys.exit(1)
 
-    # ---- scan mode ----
     if args.scan is not None:
         roots = list(args.scan) if args.scan else list(SCAN_ROOTS)
         if not args.scan:
@@ -944,22 +1004,24 @@ def main():
         log(f"[warn] cookie file not found: {cookie_file} — running without cookies")
         cookie_file = None
 
-    # ---- prune-removed mode ----
     if args.prune_removed:
         log("Pruning files removed from playlists (checking availability)...")
         prune_removed(entries, lib, cookie_file, dry_run=args.dry_run)
         log("=== done (prune-removed) ===")
         return
 
-    # ---- pre-run sync ----
     if not args.no_sync and not args.dry_run:
         run_sync(lib, entries)
 
     post_hook = make_post_hook(lib) if DEDUPE else None
     archive_ids = load_archive_ids(GLOBAL_ARCHIVE)
+    unavailable = load_unavailable()
 
     log(f"Loaded {len(entries)} entry(ies). Dedupe={'on' if DEDUPE else 'off'} "
-        f"(library: {len(lib.fps)} fingerprint(s)).")
+        f"(library: {len(lib.fps)} fingerprint(s), "
+        f"{len(unavailable)} known-unavailable).")
+
+    newly_unavailable = set()
 
     for idx, (comment, url, kind, download_path) in enumerate(entries, 1):
         label = f" — {comment}" if comment else ""
@@ -970,11 +1032,22 @@ def main():
             continue
 
         playlist_items = None
+        missing = []
         if not args.no_fast:
-            skip, playlist_items, note = plan_fast_skip(url, archive_ids, cookie_file)
-            log(f"    [fast] {note}")
-            if skip:
+            plan = plan_fast_skip(url, archive_ids, unavailable, cookie_file)
+            log(f"    [fast] {plan['note']}")
+
+            fresh = plan["detected"] - unavailable
+            if fresh:
+                unavailable |= fresh
+                save_unavailable(unavailable)
+                log(f"    [fast] recorded {len(fresh)} unavailable id(s) "
+                    f"from playlist metadata")
+
+            if plan["skip"]:
                 continue
+            playlist_items = plan["items"]
+            missing = plan["missing"]
 
         if CLEAN_PART_FILES and not args.no_clean:
             clean_stale_parts(download_path)
@@ -990,8 +1063,20 @@ def main():
         except Exception as e:
             log(f"    [error] entry {idx}: {e}")
 
+        # Anything still not archived after the pass is presumed unavailable
         archive_ids = load_archive_ids(GLOBAL_ARCHIVE)
+        for vid in missing:
+            if vid not in archive_ids:
+                newly_unavailable.add(vid)
+                log(f"    [gone] {vid} still missing — marked unavailable")
+
         log("")
+
+    if newly_unavailable:
+        unavailable |= newly_unavailable
+        save_unavailable(unavailable)
+        log(f"[unavailable] recorded {len(newly_unavailable)} id(s); "
+            f"{len(unavailable)} total. Use --recheck-unavailable to reset.")
 
     log("=== done ===")
 
