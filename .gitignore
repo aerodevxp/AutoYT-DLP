@@ -3,3 +3,4 @@ venv/
 *.log
 .cache/
 .deno/
+.global_archive.txt
