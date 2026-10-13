@@ -1,2 +1,2 @@
-yt-dlp[default]
+yt-dlp[curl-cffi]
 python-dotenv

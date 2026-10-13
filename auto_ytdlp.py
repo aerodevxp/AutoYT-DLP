@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 auto_ytdlp.py — Bulk playlist downloader built on yt-dlp, with cross-folder
-content dedupe.
+content dedupe and timestamped logging.
 
 Config is loaded from a .env file (see .env.example).
 
@@ -22,6 +22,8 @@ Dedupe (folder-independent):
 """
 
 import argparse
+import atexit
+import datetime
 import fnmatch
 import hashlib
 import json
@@ -29,8 +31,10 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 try:
     import yt_dlp
@@ -41,6 +45,10 @@ try:
     from dotenv import load_dotenv
 except ImportError:
     sys.exit("python-dotenv not installed. Run: pip install -U python-dotenv")
+
+
+def _bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
 # ---------------------------------------------------------------------------
@@ -59,25 +67,38 @@ AUDIO_TEMPLATE   = os.getenv(
     "%(playlist_index)03d - %(title)s [%(id)s].%(ext)s",
 )
 MERGE_FORMAT     = os.getenv("MERGE_FORMAT", "mp4")
-FORMAT_SELECTOR  = os.getenv("FORMAT_SELECTOR", "bv*+ba/b")
-AUDIO_FORMAT     = os.getenv("AUDIO_FORMAT", "bestaudio/best")
+FORMAT_SELECTOR  = os.getenv("FORMAT_SELECTOR", "b[ext=mp4]/b")
+AUDIO_FORMAT     = os.getenv("AUDIO_FORMAT", "bestaudio[ext=m4a]/bestaudio")
+JS_RUNTIME_DIR   = os.getenv("JS_RUNTIME_DIR", "").strip()
+CLEAN_PART_FILES = _bool("CLEAN_PART_FILES", "true")
+
+# --- Post-processing toggles (all off by default = no ffmpeg) ---
+AUDIO_CONVERT    = _bool("AUDIO_CONVERT", "false")
+EMBED_THUMBNAIL  = _bool("EMBED_THUMBNAIL", "false")
+EMBED_METADATA   = _bool("EMBED_METADATA", "false")
 AUDIO_CODEC      = os.getenv("AUDIO_CODEC", "mp3")
 AUDIO_QUALITY    = os.getenv("AUDIO_QUALITY", "192")
-JS_RUNTIME_DIR   = os.getenv("JS_RUNTIME_DIR", "").strip()
-CLEAN_PART_FILES = os.getenv("CLEAN_PART_FILES", "true").strip().lower() in (
-    "1", "true", "yes", "on")
 
 REMOTE_COMPONENTS = [c.strip() for c in
                      os.getenv("REMOTE_COMPONENTS", "ejs:github").split(",")
                      if c.strip()]
 CACHE_DIR  = os.getenv("CACHE_DIR", "./.cache/yt-dlp")
-VERBOSE    = os.getenv("VERBOSE", "false").strip().lower() in (
-    "1", "true", "yes", "on")
+VERBOSE    = _bool("VERBOSE", "false")
 EXTRACTOR_ARGS_RAW = os.getenv("EXTRACTOR_ARGS", "")
 
+SLEEP_INTERVAL          = float(os.getenv("SLEEP_INTERVAL", "0"))
+MAX_SLEEP_INTERVAL      = float(os.getenv("MAX_SLEEP_INTERVAL", "0"))
+SLEEP_INTERVAL_REQUESTS = float(os.getenv("SLEEP_INTERVAL_REQUESTS", "0"))
+CONCURRENT_FRAGMENTS    = int(os.getenv("CONCURRENT_FRAGMENTS", "4"))
+
+# --- Logging ---
+LOG_FILE = os.getenv("LOG_FILE", "./auto_ytdlp.log")
+LOG_PROGRESS_INTERVAL = float(os.getenv("LOG_PROGRESS_INTERVAL", "30"))
+HEARTBEAT_INTERVAL    = float(os.getenv("HEARTBEAT_INTERVAL", "60"))
+SCAN_LOG_EVERY        = int(os.getenv("SCAN_LOG_EVERY", "200"))
+
 # --- Dedupe ---
-DEDUPE         = os.getenv("DEDUPE", "true").strip().lower() in (
-    "1", "true", "yes", "on")
+DEDUPE         = _bool("DEDUPE", "true")
 GLOBAL_ARCHIVE = os.getenv("GLOBAL_ARCHIVE", "./.global_archive.txt")
 LIBRARY_FILE   = os.getenv("LIBRARY_FILE", "./.dedupe_library.json")
 DEDUPE_KEEP    = os.getenv("DEDUPE_KEEP", "existing").strip().lower()
@@ -100,7 +121,6 @@ if not SCAN_EXTS:
 
 PART_PATTERNS = ("*.part", "*.part-Frag*", "*.ytdl")
 
-# Best-effort YouTube ID extraction from filenames
 ID_PATTERNS = [
     re.compile(r"[\[\(]([A-Za-z0-9_-]{11})[\]\)]"),
     re.compile(r"\s-\s([A-Za-z0-9_-]{11})(?=\.[a-z0-9]+$)"),
@@ -108,6 +128,57 @@ ID_PATTERNS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+_log_lock = threading.Lock()
+_log_fh = None
+_last_activity = time.time()
+_hb_stop = threading.Event()
+
+
+def log(msg: str, console: bool = True):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{ts} {msg}"
+    with _log_lock:
+        if _log_fh:
+            _log_fh.write(line + "\n")
+            _log_fh.flush()
+        if console:
+            print(line, flush=True)
+
+
+def touch():
+    global _last_activity
+    _last_activity = time.time()
+
+
+def init_log():
+    global _log_fh
+    if not LOG_FILE:
+        return
+    p = os.path.abspath(os.path.expanduser(LOG_FILE))
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    _log_fh = open(p, "a", encoding="utf-8")
+    atexit.register(_log_fh.close)
+
+
+def _heartbeat_loop():
+    last = time.time()
+    while not _hb_stop.wait(5):
+        now = time.time()
+        if now - last >= HEARTBEAT_INTERVAL:
+            last = now
+            log(f"[heartbeat] idle {now - _last_activity:.0f}s — still running")
+
+
+def start_heartbeat():
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 def extract_video_id(name: str):
     for pat in ID_PATTERNS:
         m = pat.search(name)
@@ -132,7 +203,141 @@ def parse_extractor_args(raw: str) -> dict:
             opts.setdefault(k.strip(), []).append(v.strip())
     return result
 
+def fetch_playlist_ids(url, cookie_file):
+    """Return the set of video IDs currently in a playlist/channel."""
+    opts = {
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": True,
+        "remote_components": REMOTE_COMPONENTS,
+        "cachedir": os.path.abspath(os.path.expanduser(CACHE_DIR)),
+    }
+    if cookie_file:
+        opts["cookiefile"] = os.path.expanduser(cookie_file)
+    ids = set()
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False) or {}
 
+    def walk(node):
+        for e in node.get("entries") or []:
+            if not e:
+                continue
+            if e.get("id"):
+                ids.add(e["id"])
+            if e.get("entries"):
+                walk(e)
+
+    walk(info)
+    return ids
+
+
+def video_url_for(playlist_url, vid):
+    """Best-effort single-video URL for an ID, based on the playlist's host."""
+    host = urlparse(playlist_url).netloc.lower()
+    if "youtube" in host or "youtu.be" in host:
+        return f"https://www.youtube.com/watch?v={vid}"
+    if "pornhub" in host:
+        return f"https://www.pornhub.com/view_video.php?viewkey={vid}"
+    if "spankbang" in host:
+        return f"https://spankbang.com/{vid}/video/"
+    return None
+
+
+def video_still_exists(video_url, cookie_file):
+    """True only if the video resolves. Any error => False (keep the file)."""
+    opts = {
+        "skip_download": True,
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": True,
+        "remote_components": REMOTE_COMPONENTS,
+        "cachedir": os.path.abspath(os.path.expanduser(CACHE_DIR)),
+    }
+    if cookie_file:
+        opts["cookiefile"] = os.path.expanduser(cookie_file)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+        return bool(info)
+    except Exception:
+        return False
+
+
+def remove_from_archive(archive_path, vid):
+    """Drop any '<extractor> <vid>' line for this video."""
+    archive_path = os.path.abspath(os.path.expanduser(archive_path))
+    if not os.path.isfile(archive_path):
+        return False
+    lines = open(archive_path, encoding="utf-8").read().splitlines()
+    kept = [l for l in lines if not l.strip().endswith(" " + vid)]
+    if len(kept) != len(lines):
+        with open(archive_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(kept) + "\n")
+        return True
+    return False
+
+
+def prune_removed(entries, lib, cookie_file, dry_run=False):
+    """Delete local files that were removed from a playlist but still exist
+    on the source site. Videos that are gone entirely are kept."""
+    excluded = make_excluder(SCAN_EXCLUDE)
+    removed = 0
+    kept_gone = 0
+
+    for comment, url, kind, download_path in entries:
+        root = Path(os.path.expanduser(download_path))
+        if not root.is_dir():
+            continue
+
+        log(f"[prune] {url} -> {root}")
+        try:
+            current = fetch_playlist_ids(url, cookie_file)
+        except Exception as e:
+            log(f"[prune]   playlist fetch failed: {e}")
+            continue
+        log(f"[prune]   {len(current)} item(s) currently in playlist")
+
+        for f in sorted(root.rglob("*")):
+            if not f.is_file():
+                continue
+            if f.suffix.lower() not in SCAN_EXTS:
+                continue
+            if excluded(str(f)):
+                continue
+            vid = extract_video_id(f.name)
+            if not vid or vid in current:
+                continue
+
+            # orphan candidate
+            vurl = video_url_for(url, vid)
+            if not vurl:
+                log(f"[prune]   ? {f.name} (no url pattern, kept)")
+                continue
+
+            if dry_run:
+                log(f"[prune]   would check: {f.name}")
+                continue
+
+            touch()
+            if video_still_exists(vurl, cookie_file):
+                try:
+                    f.unlink()
+                    lib.unregister(str(f))
+                    remove_from_archive(GLOBAL_ARCHIVE, vid)
+                    removed += 1
+                    log(f"[prune]   removed (still on site): {f.name}")
+                except OSError as e:
+                    log(f"[prune]   delete failed {f.name}: {e}")
+            else:
+                kept_gone += 1
+                log(f"[prune]   kept (gone from site): {f.name}")
+
+            time.sleep(SLEEP_INTERVAL_REQUESTS or 1)
+
+    lib.save()
+    log(f"[prune] done. removed {removed}, kept {kept_gone} (unavailable).")
 # ---------------------------------------------------------------------------
 # Content-hash library
 # ---------------------------------------------------------------------------
@@ -165,7 +370,6 @@ class DedupeLibrary:
 
     @staticmethod
     def fingerprint(path: str, chunk: int = 1 << 20) -> str:
-        """Fast fingerprint: size + first & last 1 MiB (hashed)."""
         h = hashlib.sha256()
         size = os.path.getsize(path)
         h.update(str(size).encode())
@@ -209,15 +413,13 @@ def setup_js_runtime() -> None:
         if os.path.isdir(d):
             os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
         else:
-            print(f"[warn] JS_RUNTIME_DIR not found: {d}")
+            log(f"[warn] JS_RUNTIME_DIR not found: {d}")
 
     runtime = shutil.which("deno") or shutil.which("node")
     if runtime:
-        print(f"[ok] JS runtime: {runtime}")
+        log(f"[ok] JS runtime: {runtime}")
     else:
-        print("[warn] no JS runtime found (deno/node). YouTube n-sig will fail.")
-        print("       fix: curl -fsSL https://deno.land/install.sh | "
-              'DENO_INSTALL="$PWD/.deno" sh')
+        log("[warn] no JS runtime found (deno/node). YouTube n-sig will fail.")
 
 
 def setup_cache() -> None:
@@ -238,9 +440,9 @@ def clean_stale_parts(directory: str) -> int:
                 size = f.stat().st_size
                 f.unlink()
                 removed += 1
-                print(f"    [clean] removed stale {f.relative_to(root)} ({size} bytes)")
+                log(f"    [clean] removed stale {f.relative_to(root)} ({size} bytes)")
             except OSError as e:
-                print(f"    [clean] could not remove {f}: {e}")
+                log(f"    [clean] could not remove {f}: {e}")
     return removed
 
 
@@ -265,24 +467,25 @@ def parse_playlist_file(path: Path):
             continue
         parts = [p.strip() for p in line.split(";")]
         if len(parts) < 2 or not parts[1]:
-            print(f"  [warn] line {lineno}: need at least 'comment;url', skipping: {raw}")
+            log(f"  [warn] line {lineno}: need at least 'comment;url', skipping: {raw}")
             continue
         comment, url = parts[0], parts[1]
         kind = parts[2].lower() if len(parts) > 2 and parts[2] else "video"
         download_path = parts[3] if len(parts) > 3 and parts[3] else (comment or ".")
         if kind not in ("video", "audio"):
-            print(f"  [warn] line {lineno}: type must be 'video' or 'audio', "
-                  f"got '{kind}' — defaulting to 'video'")
+            log(f"  [warn] line {lineno}: type must be 'video' or 'audio', "
+                f"got '{kind}' — defaulting to 'video'")
             kind = "video"
         entries.append((comment, url, kind, download_path))
     return entries
 
 
 # ---------------------------------------------------------------------------
-# Dedupe post-hook
+# Dedupe post-hook + progress hook
 # ---------------------------------------------------------------------------
 def make_post_hook(lib: DedupeLibrary):
     def hook(filename, *args, **kwargs):
+        touch()
         if not DEDUPE or not filename or not os.path.isfile(filename):
             return
         try:
@@ -294,17 +497,59 @@ def make_post_hook(lib: DedupeLibrary):
                                 and os.path.isfile(old)):
                             os.remove(old)
                             lib.unregister(old)
-                            print(f"    [dedupe] removed older copy: {old}")
+                            log(f"    [dedupe] removed older copy: {old}")
                     lib.register(filename)
                 else:
                     os.remove(filename)
-                    print(f"    [dedupe] duplicate content, removed new copy: "
-                          f"{os.path.basename(filename)}")
+                    log(f"    [dedupe] duplicate content, removed new copy: "
+                        f"{os.path.basename(filename)}")
             else:
                 lib.register(filename)
             lib.save()
         except OSError as e:
-            print(f"    [dedupe] {e}")
+            log(f"    [dedupe] {e}")
+    return hook
+
+
+def make_progress_hook():
+    state = {"last": 0.0}
+
+    def hook(d):
+        touch()
+        status = d.get("status")
+        name = os.path.basename(d.get("filename", ""))
+        if status == "finished":
+            log(f"    [dl] finished: {name}")
+            state["last"] = 0.0
+            return
+        if status != "downloading":
+            return
+        now = time.time()
+        if now - state["last"] < LOG_PROGRESS_INTERVAL:
+            return
+        state["last"] = now
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        done = d.get("downloaded_bytes", 0)
+        pct = (done / total * 100) if total else 0
+        speed = d.get("speed") or 0
+        eta = d.get("eta")
+        extra = f" @ {speed/1e6:.2f}MB/s" if speed else ""
+        if eta:
+            extra += f" eta {eta:.0f}s"
+        log(f"    [dl] {pct:5.1f}% {done/1e6:.1f}MB{extra} | {name}")
+
+    return hook
+
+
+def make_pp_hook():
+    def hook(d):
+        touch()
+        status = d.get("status")
+        pp = d.get("postprocessor", "?")
+        if status == "started":
+            log(f"    [pp] {pp} started")
+        elif status == "finished":
+            log(f"    [pp] {pp} done")
     return hook
 
 
@@ -325,14 +570,14 @@ def build_ydl_opts(download_path: str, kind: str, cookie_file: str | None,
         "download_archive": archive_path,
         "nooverwrites": True,
         "outtmpl": os.path.join(download_path, template),
-        "writethumbnail": False,          # embed only, no stray image files
+        "writethumbnail": False,
 
         "ignoreerrors": True,
         "noplaylist": False,
         "continuedl": True,
         "retries": 5,
         "fragment_retries": 5,
-        "concurrent_fragment_downloads": 4,
+        "concurrent_fragment_downloads": CONCURRENT_FRAGMENTS,
 
         "remote_components": REMOTE_COMPONENTS,
         "cachedir": os.path.abspath(os.path.expanduser(CACHE_DIR)),
@@ -341,6 +586,13 @@ def build_ydl_opts(download_path: str, kind: str, cookie_file: str | None,
         "quiet": not VERBOSE,
         "no_warnings": False,
         "progress": True,
+
+	"sleep_interval": SLEEP_INTERVAL,
+        "max_sleep_interval": MAX_SLEEP_INTERVAL,
+        "sleep_interval_requests": SLEEP_INTERVAL_REQUESTS,
+
+        "progress_hooks": [make_progress_hook()],
+        "postprocessor_hooks": [make_pp_hook()],
     }
 
     if post_hook:
@@ -350,21 +602,25 @@ def build_ydl_opts(download_path: str, kind: str, cookie_file: str | None,
     if extractor_args:
         opts["extractor_args"] = extractor_args
 
+    # --- postprocessors: all off by default => no ffmpeg ---
+    pps = []
     if kind == "audio":
         opts["format"] = AUDIO_FORMAT
-        opts["postprocessors"] = [
-            {"key": "FFmpegExtractAudio", "preferredcodec": AUDIO_CODEC,
-             "preferredquality": AUDIO_QUALITY},
-            {"key": "EmbedThumbnail"},
-            {"key": "FFmpegMetadata"},
-        ]
+        if AUDIO_CONVERT:
+            pps.append({"key": "FFmpegExtractAudio",
+                        "preferredcodec": AUDIO_CODEC,
+                        "preferredquality": AUDIO_QUALITY})
     else:
         opts["format"] = FORMAT_SELECTOR
         opts["merge_output_format"] = MERGE_FORMAT
-        opts["postprocessors"] = [
-            {"key": "EmbedThumbnail"},
-            {"key": "FFmpegMetadata"},
-        ]
+
+    if EMBED_THUMBNAIL:
+        pps.append({"key": "EmbedThumbnail"})
+        opts["writethumbnail"] = False   # embed only, no stray files
+    if EMBED_METADATA:
+        pps.append({"key": "FFmpegMetadata"})
+
+    opts["postprocessors"] = pps
 
     if cookie_file:
         opts["cookiefile"] = os.path.expanduser(cookie_file)
@@ -376,7 +632,6 @@ def build_ydl_opts(download_path: str, kind: str, cookie_file: str | None,
 # Scan / seed
 # ---------------------------------------------------------------------------
 def dedupe_nested_roots(roots):
-    """Drop any root that's already inside another root."""
     roots = sorted(set(os.path.abspath(os.path.expanduser(r)) for r in roots))
     out = []
     for r in roots:
@@ -386,7 +641,6 @@ def dedupe_nested_roots(roots):
 
 
 def make_excluder(patterns):
-    """Predicate matching dirs/files to skip (path prefix or basename glob)."""
     abs_pats, name_pats = [], []
     for p in patterns:
         p = os.path.expanduser(p.strip())
@@ -414,9 +668,9 @@ def scan_roots(roots, lib: DedupeLibrary, archive_path: str):
             known = {l.strip() for l in f if l.strip()}
 
     excluded = make_excluder(SCAN_EXCLUDE)
-    print(f"[scan] SCAN_EXTS = {sorted(SCAN_EXTS)}")
+    log(f"[scan] SCAN_EXTS = {sorted(SCAN_EXTS)}")
     if SCAN_EXCLUDE:
-        print(f"[scan] SCAN_EXCLUDE = {SCAN_EXCLUDE}")
+        log(f"[scan] SCAN_EXCLUDE = {SCAN_EXCLUDE}")
 
     indexed = 0
     new_ids = 0
@@ -424,19 +678,19 @@ def scan_roots(roots, lib: DedupeLibrary, archive_path: str):
     started = time.time()
 
     def _onerror(e):
-        print(f"\n  [scan] WALK ERROR: {e}")
+        log(f"  [scan] WALK ERROR: {e}")
 
     for root in roots:
         r = os.path.expanduser(root)
         if not os.path.isdir(r):
-            print(f"  [scan] skip (no such dir): {r}")
+            log(f"  [scan] skip (no such dir): {r}")
             continue
 
         count = 0
         skipped_ext = {}
         pruned = []
-        print(f"  [scan] walking {r}")
-        last = time.time()
+        log(f"  [scan] walking {r}")
+        last_log = time.time()
 
         for dirpath, dirs, files in os.walk(r, onerror=_onerror):
             keep = []
@@ -463,7 +717,7 @@ def scan_roots(roots, lib: DedupeLibrary, archive_path: str):
                     indexed += 1
                     count += 1
                 except OSError as e:
-                    print(f"\n  [scan] {p}: {e}")
+                    log(f"  [scan] {p}: {e}")
                     continue
 
                 vid = extract_video_id(name)
@@ -473,24 +727,28 @@ def scan_roots(roots, lib: DedupeLibrary, archive_path: str):
                         known.add(line)
                         new_ids += 1
 
+                touch()
                 now = time.time()
-                if now - last >= 0.3:
-                    last = now
+
+                if count % max(SCAN_LOG_EVERY, 1) == 0:
+                    log(f"  [scan] ... {count} indexed in this root", console=False)
+
+                if now - last_log >= 1.0:
+                    last_log = now
                     elapsed = now - started
                     rate = indexed / elapsed if elapsed else 0
-                    rel = os.path.relpath(p, r)
-                    line = f"\r  [scan] {indexed} indexed ({rate:.0f}/s) | {rel}"
-                    print(f"{line[:110]:<110}", end="", flush=True)
+                    log(f"  [scan] {indexed} indexed ({rate:.0f}/s) | "
+                        f"{os.path.relpath(p, r)}")
 
         lib.save()
-        summary = f"\r  [scan] {r}: {count} indexed"
+        summary = f"  [scan] {r}: {count} indexed"
         if skipped_ext:
             summary += f"  (skipped exts: {skipped_ext})"
-        print(f"{summary}{' ' * 20}")
+        log(summary)
         if pruned:
-            print(f"  [scan] excluded {len(pruned)} dir(s): "
-                  f"{', '.join(os.path.relpath(x, r) for x in pruned[:8])}"
-                  f"{' ...' if len(pruned) > 8 else ''}")
+            log(f"  [scan] excluded {len(pruned)} dir(s): "
+                f"{', '.join(os.path.relpath(x, r) for x in pruned[:8])}"
+                f"{' ...' if len(pruned) > 8 else ''}")
 
     os.makedirs(os.path.dirname(archive_path), exist_ok=True)
     with open(archive_path, "w", encoding="utf-8") as f:
@@ -498,9 +756,9 @@ def scan_roots(roots, lib: DedupeLibrary, archive_path: str):
             f.write(line + "\n")
 
     elapsed = time.time() - started
-    print(f"\n[scan] indexed {indexed} file(s) in {elapsed:.1f}s; "
-          f"archive now has {len(known)} known id(s) (+{new_ids}).")
-    print(f"[scan] extensions seen: {seen_exts}")
+    log(f"[scan] indexed {indexed} file(s) in {elapsed:.1f}s; "
+        f"archive now has {len(known)} known id(s) (+{new_ids}).")
+    log(f"[scan] extensions seen: {seen_exts}")
 
 
 # ---------------------------------------------------------------------------
@@ -515,14 +773,12 @@ def main():
     ap.add_argument("-e", "--env", default=".env")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-clean", action="store_true")
+    ap.add_argument("--prune-removed", action="store_true",
+                    help="Delete files removed from a playlist, but only if the "
+                         "video still exists on the site.")
     ap.add_argument("-v", "--verbose", action="store_true")
-    ap.add_argument("--exclude", action="append", default=[], metavar="NAME",
-                    help="Exclude a folder name/glob or path from --scan "
-                         "(repeatable)")
-    ap.add_argument("--scan", nargs="*", metavar="DIR",
-                    help="Index existing files + seed the global ID archive, "
-                         "then exit. With no DIRs, uses SCAN_ROOTS and every "
-                         "downloaddir from the playlist file.")
+    ap.add_argument("--exclude", action="append", default=[], metavar="NAME")
+    ap.add_argument("--scan", nargs="*", metavar="DIR")
     args = ap.parse_args()
 
     if args.env != ".env":
@@ -532,6 +788,12 @@ def main():
         VERBOSE = True
     if args.exclude:
         SCAN_EXCLUDE = SCAN_EXCLUDE + args.exclude
+
+    init_log()
+    start_heartbeat()
+
+    log(f"=== start pid={os.getpid()} cwd={os.getcwd()} "
+        f"argv={' '.join(sys.argv[1:]) or '(none)'} ===")
 
     setup_js_runtime()
     setup_cache()
@@ -543,7 +805,8 @@ def main():
     if playlist_file.is_file():
         entries = parse_playlist_file(playlist_file)
     elif not args.scan:
-        sys.exit(f"Playlist file not found: {playlist_file}")
+        log(f"Playlist file not found: {playlist_file}")
+        sys.exit(1)
 
     # ---- scan mode ----
     if args.scan is not None:
@@ -551,28 +814,29 @@ def main():
         if not args.scan:
             roots += [p for _, _, _, p in entries]
         roots = dedupe_nested_roots(roots)
-        print(f"Scanning {len(roots)} root(s)...")
+        log(f"Scanning {len(roots)} root(s)...")
         scan_roots(roots, lib, GLOBAL_ARCHIVE)
+        log("=== done (scan) ===")
         return
 
     if not entries:
-        sys.exit("No valid entries found in playlist file.")
+        log("No valid entries found in playlist file.")
+        sys.exit(1)
 
     cookie_file = COOKIES_FILE or None
     if cookie_file and not os.path.isfile(os.path.expanduser(cookie_file)):
-        print(f"[warn] cookie file not found: {cookie_file} — continuing without cookies")
+        log(f"[warn] cookie file not found: {cookie_file} — running without cookies")
         cookie_file = None
 
     post_hook = make_post_hook(lib) if DEDUPE else None
 
-    print(f"Loaded {len(entries)} entry(ies). "
-          f"Dedupe={'on' if DEDUPE else 'off'} "
-          f"(library: {len(lib.fps)} fingerprint(s)).\n")
+    log(f"Loaded {len(entries)} entry(ies). Dedupe={'on' if DEDUPE else 'off'} "
+        f"(library: {len(lib.fps)} fingerprint(s)).")
 
     for idx, (comment, url, kind, download_path) in enumerate(entries, 1):
         label = f" — {comment}" if comment else ""
-        print(f"[{idx}/{len(entries)}] ({kind}) {url}{label}")
-        print(f"    -> {download_path}")
+        log(f"[{idx}/{len(entries)}] ({kind}) {url}{label}")
+        log(f"    -> {download_path}")
 
         if args.dry_run:
             continue
@@ -580,16 +844,29 @@ def main():
         if CLEAN_PART_FILES and not args.no_clean:
             clean_stale_parts(download_path)
 
+        entry_start = time.time()
+        touch()
         try:
             with yt_dlp.YoutubeDL(
                     build_ydl_opts(download_path, kind, cookie_file, post_hook)) as ydl:
                 ydl.download([url])
+            log(f"    [done] entry {idx} in {time.time() - entry_start:.1f}s")
         except Exception as e:
-            print(f"    [error] {e}")
+            log(f"    [error] entry {idx}: {e}")
 
-        print()
+        log("")
 
-    print("Done.")
+    log("=== done ===")
+
+    # ---- prune-removed mode ----
+    if args.prune_removed:
+        if not entries:
+            sys.exit("No entries to prune.")
+        cookie_file = COOKIES_FILE or None
+        log("Pruning files removed from playlists (checking availability)...")
+        prune_removed(entries, lib, cookie_file, dry_run=args.dry_run)
+        log("=== done (prune-removed) ===")
+        return
 
 
 if __name__ == "__main__":
