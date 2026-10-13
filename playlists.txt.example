@@ -1,0 +1,6 @@
+# comment;url;videoORaudio;downloaddir
+music;https://www.youtube.com/playlist?list=XXXX;audio;/media/music
+lectures;https://www.youtube.com/playlist?list=YYYY;video;/media/lectures
+
+# comments and blank lines are fine
+podcasts;https://www.youtube.com/playlist?list=ZZZZ;audio;/media/podcasts
